@@ -133,7 +133,9 @@ function render(data) {
   const warn = $('#trialWarn');
   if (data.trialSoon && data.trialSoon.length) {
     warn.classList.remove('hidden');
-    warn.innerHTML = '<b>Essais qui se terminent sous 7 jours :</b><br>' + data.trialSoon.map(t => '· ' + esc(t.name) + ' — fin le ' + new Date(t.trialEndsAt).toLocaleDateString('fr-FR')).join('<br>');
+    warn.innerHTML = '<b>Échéances sous 7 jours :</b><br>' + data.trialSoon.map(t =>
+      '· ' + esc(t.name) + (t.kind === 'trial' ? ' — fin d’essai le ' : ' — période qui finit le ') + new Date(t.endsAt).toLocaleDateString('fr-FR')
+    ).join('<br>');
   } else warn.classList.add('hidden');
   $('#tenantList').innerHTML = data.tenants.map(t => `
     <div class="tenant-row" data-id="${esc(t.id)}" data-slug="${esc(t.slug)}">
