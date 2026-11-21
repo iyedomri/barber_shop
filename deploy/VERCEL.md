@@ -38,8 +38,14 @@ Vercel → **Settings → Environment Variables** :
 | `D17_NUMBER` | votre numéro D17 (ex. `+216 XX XXX XXX`) | recommandé — affiché sur la page de pause |
 | `PAYMENT_LINK` | lien Stripe Payment Link *(optionnel)* | — |
 | `SESSION_SECRET` | `openssl rand -hex 32` | recommandé — signature des sessions |
+| `GOOGLE_CLIENT_ID` | ID client OAuth Google *(optionnel)* | active la connexion client par Google |
 | `TZ` | `Africa/Tunis` | recommandé (le code s’y ancre par défaut) |
 | `BASE_URL` | `https://votre-domaine.tn` *(optionnel)* | — (les QR utilisent sinon l’Host de la requête) |
+
+**Connexion Google (optionnel)** : [Google Cloud Console](https://console.cloud.google.com/apis/credentials) →
+*Créer des identifiants → ID client OAuth → Application Web* → **Origines JavaScript autorisées** =
+`https://<votre-app>.vercel.app` (et votre domaine). Copiez le *numéro de client* dans `GOOGLE_CLIENT_ID`.
+Sans cette variable, les clients se connectent par leur numéro — le bouton Google reste masqué.
 
 ## 5 · Deploy
 

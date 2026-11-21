@@ -155,6 +155,36 @@ const scryptCheck = (pin, stored) => {
   return parts[2].length === h.length && crypto.timingSafeEqual(Buffer.from(parts[2]), Buffer.from(h));
 };
 
+/* ---------- connexion Google (ID token vérifié côté serveur, jamais aveuglément) ---------- */
+const httpError = (status, msg) => Object.assign(new Error(msg), { status });
+let googleJwks = { at: 0, keys: null };
+async function verifyGoogleIdToken(idToken) {
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  if (!clientId) throw httpError(503, 'Connexion Google non configurée sur ce serveur.');
+  const parts = String(idToken || '').split('.');
+  if (parts.length !== 3) throw httpError(400, 'Jeton Google invalide.');
+  const [h, p, s] = parts;
+  let header, payload;
+  try {
+    header = JSON.parse(Buffer.from(h, 'base64url').toString('utf8'));
+    payload = JSON.parse(Buffer.from(p, 'base64url').toString('utf8'));
+  } catch { throw httpError(400, 'Jeton Google illisible.'); }
+  if (payload.iss !== 'https://accounts.google.com' && payload.iss !== 'accounts.google.com') throw httpError(401, 'Émetteur du jeton non reconnu.');
+  if (payload.aud !== clientId) throw httpError(401, 'Jeton Google destiné à une autre application.');
+  if (!payload.exp || payload.exp * 1000 < Date.now()) throw httpError(401, 'Jeton Google expiré — reconnectez-vous.');
+  if (!googleJwks.keys || Date.now() - googleJwks.at > 3600e3) {
+    const r = await fetch('https://www.googleapis.com/oauth2/v3/certs').catch(() => null);
+    if (!r || !r.ok) throw httpError(503, 'Service Google injoignable — réessayez dans un instant.');
+    googleJwks = { at: Date.now(), keys: (await r.json()).keys || [] };
+  }
+  const jwk = googleJwks.keys.find(k => k.kid === header.kid) || (googleJwks.keys.length === 1 ? googleJwks.keys[0] : null);
+  if (!jwk) throw httpError(503, 'Clés de vérification Google indisponibles.');
+  const key = crypto.createPublicKey({ key: jwk, format: 'jwk' });
+  const sigOk = crypto.verify('RSA-SHA256', Buffer.from(h + '.' + p), key, Buffer.from(s, 'base64url'));
+  if (!sigOk) throw httpError(401, 'Signature Google invalide.');
+  return payload;
+}
+
 /* ---------- accents de marque curatés (aucun violet « IA ») ---------- */
 const ACCENTS = {
   brass:    { base: '#C2A04E', dark: '#A8843A', light: '#E3C878', label: 'Or laiton' },
@@ -240,6 +270,7 @@ function seedCarthageStore(tenant) {
   const t = Date.now();
   const mk = (name, phone, stamps, daysAgo, visits, rewards = 0) => ({
     id: uid('clt'), name, phone, code: publicCode(),
+    email: '', googleSub: null,
     token: crypto.randomBytes(24).toString('hex'),
     stamps, totalVisits: visits, rewardsRedeemed: rewards,
     createdAt: new Date(t - (daysAgo + 40) * day).toISOString(),
@@ -267,6 +298,7 @@ function seedRoyalStore(tenant) {
   const t = Date.now();
   const mk = (name, phone, stamps, daysAgo, visits) => ({
     id: uid('clt'), name, phone, code: publicCode(),
+    email: '', googleSub: null,
     token: crypto.randomBytes(24).toString('hex'),
     stamps, totalVisits: visits, rewardsRedeemed: 0,
     createdAt: new Date(t - 30 * day).toISOString(),
@@ -361,6 +393,7 @@ function saveDb() {
    (JSON.parse casse la référence partagée) — on la rétablit : les réglages admin
    (db.shop) et la vue super-admin (platform.tenants) doivent parler du même objet. */
 function relinkStores() {
+  platform.payments = platform.payments || []; // journal des encaissements (cash/D17/carte)
   for (const t of platform.tenants) {
     const store = platform.stores[t.id];
     if (store) store.shop = t;
@@ -596,6 +629,7 @@ function tenantBrandVars(t) {
     '{{D17_BLOCK}}': (() => { const price = String(t.monthlyPrice ?? 40); const n = String(process.env.D17_NUMBER || '').trim(); return n ? '<div style="margin:0 0 14px;padding:14px 12px;border:1px dashed var(--brass,#C2A04E);border-radius:14px;background:rgba(194,160,78,.08)"><div style="font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--brass-dark,#A8843A);margin-bottom:6px">Paiement D17 — mobile money</div><div style="font-family:var(--font-display);font-size:22px;font-weight:600;color:#16301F;letter-spacing:.04em">' + escHtml(n) + '</div><div style="font-size:11px;color:#5B5343;margin-top:4px">Envoyez <b>' + price + ' DT</b> (un mois d’abonnement) avec votre nom de salon en référence. Le barbier rallume le salon dès réception.</div></div>' : ''; })(),
     '{{STRIPE_BUTTON}}': (() => { const l = link; const price = String(t.monthlyPrice ?? 40); return l ? '<a href="' + escHtml(l) + '" class="btn btn-brass btn-full" style="text-decoration:none;display:block">Régler par carte — ' + price + ' DT / mois</a>' : ''; })(),
     '{{MONTHLY_PRICE}}': String(t.monthlyPrice ?? 40),
+    '{{GOOGLE_CLIENT_ID_JS}}': JSON.stringify(process.env.GOOGLE_CLIENT_ID || ''),
   };
 }
 function renderPublicFile(file, tenant) {
@@ -719,6 +753,7 @@ route('POST', '/api/join', async (req, res) => {
   if (!client) {
     client = {
       id: uid('clt'), name, phone, code: publicCode(),
+      email: '', googleSub: null,
       token: crypto.randomBytes(24).toString('hex'),
       stamps: 0, totalVisits: 0, rewardsRedeemed: 0,
       createdAt: new Date().toISOString(), lastVisitAt: null,
@@ -748,6 +783,53 @@ route('POST', '/api/join', async (req, res) => {
   }
   saveDb();
   sendJson(res, created ? 201 : 200, { token: client.token, code: client.code, created, card: clientPublic(client), reward: rewardState(client), referralApplied });
+});
+
+/* ---- connexion client : numéro de téléphone OU compte Google ------------------ */
+route('POST', '/api/login/phone', async (req, res) => {
+  const ip = clientIp(req);
+  if (!rateLimit('loginphone:' + ip, 10, 60e3)) return sendJson(res, 429, { error: 'Trop de tentatives. Réessayez dans une minute.' });
+  const body = await readBody(req);
+  const phone = normPhone(body.phone);
+  if (!validPhone(phone)) return badRequest(res, 'Numéro de téléphone invalide (ex : +216 98 123 456).');
+  const c = db.clients.find(x => x.phone === phone);
+  if (!c) return sendJson(res, 404, { error: 'Aucune carte pour ce numéro — créez votre carte en 30 secondes.' });
+  // connexion = nouveau téléphone : le token est renouvelé (l’ancien appareil perd l’accès)
+  c.token = crypto.randomBytes(24).toString('hex');
+  saveDb();
+  sendJson(res, 200, { token: c.token, code: c.code, created: false, card: clientPublic(c), reward: rewardState(c), auth: 'phone' });
+});
+route('POST', '/api/login/google', async (req, res) => {
+  const ip = clientIp(req);
+  if (!rateLimit('logingoogle:' + ip, 10, 60e3)) return sendJson(res, 429, { error: 'Trop de tentatives. Réessayez dans une minute.' });
+  const body = await readBody(req);
+  let payload;
+  try {
+    payload = await verifyGoogleIdToken(body.credential || body.idToken);
+  } catch (e) {
+    return sendJson(res, e.status || 401, { error: e.message || 'Connexion Google refusée.' });
+  }
+  let c = db.clients.find(x => x.googleSub === payload.sub);
+  let created = false;
+  if (!c) {
+    c = {
+      id: uid('clt'),
+      name: String(payload.name || payload.email || 'Client').slice(0, 80),
+      phone: '', email: String(payload.email || '').slice(0, 120), googleSub: payload.sub,
+      code: publicCode(), token: crypto.randomBytes(24).toString('hex'),
+      stamps: 0, totalVisits: 0, rewardsRedeemed: 0,
+      createdAt: new Date().toISOString(), lastVisitAt: null,
+      lastReminderAt: null, birthday: null, notes: '',
+      referrals: 0, pushSubscriptions: [], lastBirthdayYear: null,
+    };
+    db.clients.push(c);
+    maybeBirthday(c);
+    created = true;
+  } else {
+    c.token = crypto.randomBytes(24).toString('hex');
+  }
+  saveDb();
+  sendJson(res, created ? 201 : 200, { token: c.token, code: c.code, created, card: clientPublic(c), reward: rewardState(c), auth: 'google' });
 });
 
 route('GET', '/api/card', (req, res, query) => {
@@ -1326,7 +1408,10 @@ async function handleSuperApi(req, res, rest) {
       const ip = clientIp(req);
       if (!rateLimit('superlogin:' + ip, 10, 60e3)) return sendJson(res, 429, { error: 'Trop de tentatives. Réessayez dans une minute.' });
       const body = await readBodyMaybe(req);
-      if (String(body.pin) !== String(SUPER_ADMIN_PIN)) return sendJson(res, 403, { error: 'Code super-admin incorrect.' });
+      // PIN maître (env) OU PIN changé depuis l’espace admin (hashé scrypt dans la plateforme)
+      const ok = String(body.pin) === String(SUPER_ADMIN_PIN)
+        || (platform.superPinHash && scryptCheck(body.pin, platform.superPinHash));
+      if (!ok) return sendJson(res, 403, { error: 'Code super-admin incorrect.' });
       return sendJson(res, 200, { session: signSession({ typ: 'super' }, 12 * 3600e3) });
     }
     if (!superSessionOk(req)) return sendJson(res, 401, { error: 'Session super-admin requise.' });
@@ -1341,7 +1426,7 @@ async function handleSuperApi(req, res, rest) {
         ...(t.status === 'trial' ? soon(t, 'trial', t.trialEndsAt) : []),
         ...(t.status === 'active' ? soon(t, 'period', t.currentPeriodEnd) : []),
       ]).sort((a, b) => new Date(a.endsAt) - new Date(b.endsAt));
-      return sendJson(res, 200, { tenants, mrr, counts: { total: tenants.length, active: tenants.filter(t => t.status === 'active').length, trial: tenants.filter(t => t.status === 'trial').length, paused: tenants.filter(t => t.status === 'paused').length }, trialSoon });
+      return sendJson(res, 200, { tenants, mrr, counts: { total: tenants.length, active: tenants.filter(t => t.status === 'active').length, trial: tenants.filter(t => t.status === 'trial').length, paused: tenants.filter(t => t.status === 'paused').length }, trialSoon, payments: (platform.payments || []).slice(0, 20) });
     }
     if (rest === '/api/tenants' && req.method === 'POST') {
       const b = await readBodyMaybe(req);
@@ -1367,18 +1452,57 @@ async function handleSuperApi(req, res, rest) {
       saveDb(); await flushPersist();
       return sendJson(res, 201, { tenant: tenantPublic(t), adminPin: pin });
     }
-    const m = rest.match(/^\/api\/tenants\/([^/]+)(\/(pay|pause|resume|delete))?$/);
+    if (rest === '/api/settings/pin' && req.method === 'POST') {
+      const b = await readBodyMaybe(req);
+      const ok = String(b.pin) === String(SUPER_ADMIN_PIN)
+        || (platform.superPinHash && scryptCheck(b.pin, platform.superPinHash));
+      if (!ok) return sendJson(res, 403, { error: 'PIN actuel incorrect.' });
+      const newPin = String(b.newPin || '').trim().slice(0, 24);
+      if (newPin.length < 4) return sendJson(res, 400, { error: 'Le nouveau PIN doit faire au moins 4 caractères.' });
+      platform.superPinHash = scryptHash(newPin);
+      saveDb(); await flushPersist();
+      return sendJson(res, 200, { ok: true });
+    }
+    const m = rest.match(/^\/api\/tenants\/([^/]+)(\/(pay|pause|resume|delete|trial|reset-pin))?$/);
     if (m) {
       const t = findTenantById(m[1]);
       if (!t) return sendJson(res, 404, { error: 'Salon introuvable.' });
       const action = m[3];
       if (!action && req.method === 'GET') return sendJson(res, 200, { tenant: tenantPublic(t) });
       if (action === 'pay' && req.method === 'POST') {
+        const b = await readBodyMaybe(req);
         t.status = 'active';
         t.currentPeriodEnd = new Date(Date.now() + 30 * 864e5).toISOString();
         t.trialEndsAt = null;
+        // encaissement journalisé : espèces / D17 / carte — la preuve du paiement pour le vendeur
+        platform.payments.unshift({
+          id: uid('pay'), tenantId: t.id, tenantSlug: t.slug, tenantName: t.name,
+          amount: Number(b.amount) || Number(t.monthlyPrice) || 0,
+          currency: t.currency || 'DT',
+          method: ['cash', 'd17', 'card', 'other'].includes(b.method) ? b.method : 'other',
+          note: esc(b.note || '').trim().slice(0, 140),
+          at: new Date().toISOString(),
+        });
+        platform.payments = platform.payments.slice(0, 300);
         saveDb(); await flushPersist();
         return sendJson(res, 200, { tenant: tenantPublic(t) });
+      }
+      if (action === 'trial' && req.method === 'POST') {
+        const b = await readBodyMaybe(req);
+        const days = Math.max(1, Math.min(60, Number(b.days) || 7));
+        if (t.status !== 'trial') return sendJson(res, 409, { error: 'Ce salon n’est plus en essai.' });
+        const base = t.trialEndsAt && new Date(t.trialEndsAt) > new Date() ? new Date(t.trialEndsAt) : new Date();
+        t.trialEndsAt = new Date(base.getTime() + days * 864e5).toISOString();
+        saveDb(); await flushPersist();
+        return sendJson(res, 200, { tenant: tenantPublic(t), message: `Essai prolongé de ${days} jours.` });
+      }
+      if (action === 'reset-pin' && req.method === 'POST') {
+        const b = await readBodyMaybe(req);
+        const pin = String(b.pin || '').trim().slice(0, 24) || String(Math.floor(100000 + Math.random() * 900000));
+        if (pin.length < 4) return sendJson(res, 400, { error: 'Le PIN doit faire au moins 4 caractères.' });
+        t.adminPinHash = scryptHash(pin);
+        saveDb(); await flushPersist();
+        return sendJson(res, 200, { tenant: tenantPublic(t), adminPin: pin });
       }
       if (action === 'pause' && req.method === 'POST') { t.status = 'paused'; saveDb(); await flushPersist(); return sendJson(res, 200, { tenant: tenantPublic(t) }); }
       if (action === 'resume' && req.method === 'POST') {
