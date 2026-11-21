@@ -131,7 +131,12 @@ const db = new Proxy({}, {
     if (!store) throw new Error('Accès hors contexte salon (' + String(prop) + ')');
     return store[prop];
   },
-  set: (_, prop, value) => { DB()[prop] = value; return true; },
+  set: (_, prop, value) => {
+    const store = DB();
+    if (!store) throw new Error('Accès hors contexte salon (' + String(prop) + ')');
+    store[prop] = value;
+    return true;
+  },
 });
 
 /* ---------- hash de PIN (scrypt, zéro dépendance) ---------- */
@@ -162,6 +167,7 @@ const slugify = (s) => String(s || '').toLowerCase().normalize('NFD').replace(/[
 /* ---------- tenants ---------- */
 function makeTenant(cfg) {
   const id = uid('tnt');
+  const status = ['trial', 'active', 'paused'].includes(cfg.status) ? cfg.status : 'trial';
   return {
     id,
     slug: cfg.slug,
@@ -181,9 +187,9 @@ function makeTenant(cfg) {
     adminPinHash: cfg.adminPinHash || scryptHash(cfg.adminPin || '1234'),
     accent: ACCENTS[cfg.accent] ? cfg.accent : 'brass',
     monogram: String(cfg.monogram || autoMonogram(cfg.name)).slice(0, 3).toUpperCase(),
-    status: cfg.status || 'trial',
-    trialEndsAt: cfg.status === 'trial' ? new Date(Date.now() + (Number(cfg.trialDays) || 14) * 864e5).toISOString() : null,
-    currentPeriodEnd: cfg.status === 'active' ? new Date(Date.now() + 30 * 864e5).toISOString() : null,
+    status,
+    trialEndsAt: status === 'trial' ? new Date(Date.now() + (Number(cfg.trialDays) || 14) * 864e5).toISOString() : null,
+    currentPeriodEnd: status === 'active' ? new Date(Date.now() + 30 * 864e5).toISOString() : null,
     monthlyPrice: cfg.monthlyPrice !== undefined ? Number(cfg.monthlyPrice) : 40,
     paymentLink: cfg.paymentLink || '',
     createdAt: new Date().toISOString(),
@@ -329,6 +335,15 @@ function saveDb() {
   if (IS_PG) { platformDirty = true; return; } // persisté en fin de requête (Vercel)
   persistFile();
 }
+/* Après un chargement (fichier ou Postgres), stores[id].shop est une COPIE du tenant
+   (JSON.parse casse la référence partagée) — on la rétablit : les réglages admin
+   (db.shop) et la vue super-admin (platform.tenants) doivent parler du même objet. */
+function relinkStores() {
+  for (const t of platform.tenants) {
+    const store = platform.stores[t.id];
+    if (store) store.shop = t;
+  }
+}
 async function flushPersist() {
   if (!IS_PG || !platformDirty) return;
   platformDirty = false;
@@ -344,6 +359,7 @@ async function loadPlatform() {
       const r = await client.query("SELECT value FROM barbier_kv WHERE key='platform'");
       platform = r.rows.length ? r.rows[0].value : (SEED_DEMO ? seedPlatform() : { version: PLATFORM_VERSION, tenants: [], stores: {}, vapid: null });
       if (!r.rows.length) await persistPostgres();
+      relinkStores();
       console.log(`[db] plateforme chargée depuis Postgres — ${platform.tenants.length} salon(s)`);
     } finally { await client.end(); }
     return;
@@ -353,9 +369,11 @@ async function loadPlatform() {
     const raw = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
     platform = raw && raw.version === PLATFORM_VERSION ? raw : migrateLegacy(raw);
     if (raw && raw.version !== PLATFORM_VERSION) { persistFile(); console.log('[db] v1 migrée → plateforme multi-tenant'); }
+    relinkStores();
     console.log(`[db] plateforme chargée — ${platform.tenants.length} salon(s)`);
   } catch {
     platform = SEED_DEMO ? seedPlatform() : { version: PLATFORM_VERSION, tenants: [], stores: {}, vapid: null };
+    relinkStores();
     persistFile();
     console.log('[db] plateforme initialisée — 2 salons de démo (carthage · royalbarber)');
   }
@@ -463,7 +481,8 @@ function notFoundPage(path) {
 }
 const notFound = (res, path) => {
   console.warn('[404]', path || '(route)');
-  if (!path || path.includes('/api/') || path.startsWith('/api')) {
+  if (!path) return sendJson(res, 404, { error: 'Introuvable' });
+  if (path.includes('/api/') || path.startsWith('/api')) {
     // /api/* en racine = anciennes pages mono-tenant en cache (v1) : le message guide vers le rechargement
     if (!path.startsWith('/s/')) return sendJson(res, 404, { error: 'Page périmée — rechargez avec Ctrl+F5 ou repassez par l’accueil.' });
     return sendJson(res, 404, { error: 'Introuvable' });
@@ -474,16 +493,17 @@ const badRequest = (res, msg) => sendJson(res, 400, { error: msg });
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
+    const fail = (msg, status) => { const e = new Error(msg); e.status = status; reject(e); };
     let data = '';
     req.on('data', (chunk) => {
       data += chunk;
-      if (data.length > 100 * 1024) { reject(new Error('payload too large')); req.destroy(); }
+      if (data.length > 100 * 1024) { fail('Corps de requête trop volumineux.', 413); req.destroy(); }
     });
     req.on('end', () => {
       if (!data) return resolve({});
-      try { resolve(JSON.parse(data)); } catch { reject(new Error('JSON invalide')); }
+      try { resolve(JSON.parse(data)); } catch { fail('JSON invalide', 400); }
     });
-    req.on('error', reject);
+    req.on('error', (e) => reject(e));
   });
 }
 
@@ -673,8 +693,11 @@ route('POST', '/api/join', async (req, res) => {
       }
     }
     maybeBirthday(client);
-  } else if (birthday && !client.birthday) {
-    client.birthday = birthday;
+  } else {
+    // carte retrouvée par numéro : le nouveau téléphone ÉCRASE le token (plan §11 —
+    // l’ancien appareil perd l’accès au prochain chargement, la carte se restaure partout).
+    client.token = crypto.randomBytes(24).toString('hex');
+    if (birthday && !client.birthday) client.birthday = birthday;
   }
   saveDb();
   sendJson(res, created ? 201 : 200, { token: client.token, code: client.code, created, card: clientPublic(client), reward: rewardState(client), referralApplied });
@@ -790,7 +813,7 @@ route('GET', '/api/my-reservations', (req, res, query) => {
   if (!c) return sendJson(res, 401, { error: 'Carte introuvable.' });
   const today = localDateStr();
   const nowMin = new Date().getHours() * 60 + new Date().getMinutes();
-  const mine = db.reservations.filter(r => r.clientId === c.id);
+  const mine = db.reservations.filter(r => r.clientId === c.id && r.status !== 'cancelled');
   const upcoming = mine.filter(r => r.date > today || (r.date === today && timeToMin(r.endTime) >= nowMin)).sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
   const past = mine.filter(r => !(r.date > today || (r.date === today && timeToMin(r.endTime) >= nowMin))).sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time)).slice(0, 5);
   sendJson(res, 200, { upcoming, past });
@@ -1255,6 +1278,8 @@ async function handleSuperApi(req, res, rest) {
       // fallthrough below
     }
     if (rest === '/api/login' && req.method === 'POST') {
+      const ip = req.socket.remoteAddress || 'ip';
+      if (!rateLimit('superlogin:' + ip, 10, 60e3)) return sendJson(res, 429, { error: 'Trop de tentatives. Réessayez dans une minute.' });
       const body = await readBodyMaybe(req);
       if (String(body.pin) !== String(SUPER_ADMIN_PIN)) return sendJson(res, 403, { error: 'Code super-admin incorrect.' });
       const s = crypto.randomBytes(24).toString('hex');
@@ -1266,7 +1291,13 @@ async function handleSuperApi(req, res, rest) {
     if (rest === '/api/overview' && req.method === 'GET') {
       const tenants = platform.tenants.map(tenantPublic);
       const mrr = platform.tenants.filter(t => t.status === 'active').reduce((sum, t) => sum + (Number(t.monthlyPrice) || 0), 0);
-      const trialSoon = platform.tenants.filter(t => t.status === 'trial' && t.trialEndsAt && new Date(t.trialEndsAt) > new Date() && (new Date(t.trialEndsAt) - new Date()) < 7 * 864e5).map(t => ({ slug: t.slug, name: t.name, trialEndsAt: t.trialEndsAt }));
+      // échéances sous 7 jours : essais ET périodes actives (plan §6 — « essais/périodes qui expirent »)
+      const soon = (t, kind, endsAt) => endsAt && new Date(endsAt) > new Date() && (new Date(endsAt) - new Date()) < 7 * 864e5
+        ? [{ slug: t.slug, name: t.name, kind, endsAt }] : [];
+      const trialSoon = platform.tenants.flatMap(t => [
+        ...(t.status === 'trial' ? soon(t, 'trial', t.trialEndsAt) : []),
+        ...(t.status === 'active' ? soon(t, 'period', t.currentPeriodEnd) : []),
+      ]).sort((a, b) => new Date(a.endsAt) - new Date(b.endsAt));
       return sendJson(res, 200, { tenants, mrr, counts: { total: tenants.length, active: tenants.filter(t => t.status === 'active').length, trial: tenants.filter(t => t.status === 'trial').length, paused: tenants.filter(t => t.status === 'paused').length }, trialSoon });
     }
     if (rest === '/api/tenants' && req.method === 'POST') {
@@ -1319,7 +1350,7 @@ async function handleSuperApi(req, res, rest) {
       return sendJson(res, 405, { error: 'Méthode non autorisée.' });
     }
     return sendJson(res, 404, { error: 'Action inconnue.' });
-  })().catch(err => { console.error('[super]', err); if (!res.headersSent) sendJson(res, 500, { error: 'Erreur super-admin.' }); });
+  })().catch(err => { console.error('[super]', err); if (!res.headersSent) sendJson(res, err.status || 500, { error: err.status ? err.message : 'Erreur super-admin.' }); });
 }
 
 /* ============================================================== server */
@@ -1372,7 +1403,7 @@ const server = http.createServer(async (req, res) => {
           notFound(res, pathname);
         } catch (err) {
           console.error('[error]', err);
-          if (!res.headersSent) sendJson(res, 500, { error: 'Erreur serveur.' });
+          if (!res.headersSent) sendJson(res, err.status || 500, { error: err.status ? err.message : 'Erreur serveur.' });
         } finally { await flushPersist(); }
       });
     }
@@ -1387,7 +1418,7 @@ const server = http.createServer(async (req, res) => {
     notFound(res, pathname);
   } catch (err) {
     console.error('[error]', err);
-    if (!res.headersSent) sendJson(res, 500, { error: 'Erreur serveur.' });
+    if (!res.headersSent) sendJson(res, err.status || 500, { error: err.status ? err.message : 'Erreur serveur.' });
   }
 });
 

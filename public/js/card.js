@@ -4,7 +4,9 @@ const API_BASE = (typeof window !== 'undefined' && window.__API_BASE__) || '';
 
 const $ = (s, p = document) => p.querySelector(s);
 const $$ = (s, p = document) => [...p.querySelectorAll(s)];
-const TOKEN_KEY = 'barbier_card_token';
+// Clé de stockage PAR SALON : deux salons ouverts sur le même téléphone ne doivent
+// pas écraser le token l’un de l’autre (isolation multi-tenant jusque dans le device).
+const TOKEN_KEY = 'barbier_card_token:' + (API_BASE || 'root');
 const token = () => localStorage.getItem(TOKEN_KEY);
 const urlParams = new URLSearchParams(location.search);
 const refCode = (urlParams.get('ref') || '').toUpperCase(); // code parrain en lien partagé

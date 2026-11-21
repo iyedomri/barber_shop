@@ -10,7 +10,8 @@
 ## En une minute
 
 ```bash
-cd barber-loyalty
+git clone https://github.com/iyedomri/barber_shop.git
+cd barber_shop
 npm install
 npm start     # → http://localhost:3000
 ```
@@ -67,7 +68,7 @@ essai 14 jours  ──(paie)──▶  actif 30 j  ──(+30 j)──▶  actif
 - **Stripe Billing + webhook** (`invoice.paid` → `POST /super/api/tenants/:id/pay`) : possible dès que vous avez un compte Stripe — il manque seulement la vérification de signature (30 min). **D17 automatisé** : à l’étude, sans date — voir *Roadmap P1*.
 
 ### Déploiement Vercel (cible officielle)
-1. **Importez le repo** dans Vercel → *Root Directory* = `barber-loyalty`. Framework preset : **Other**. Aucune commande de build.
+1. **Importez le repo** dans Vercel → *Root Directory* = racine du dépôt (`barber_shop`). Framework preset : **Other**. Aucune commande de build.
 2. **Vercel → Storage → Postgres** (ou Neon) → *Connect* : la variable **`POSTGRES_URL`** est injectée automatiquement.
 3. Variables d’environnement :
    - `SUPER_ADMIN_PIN` — le PIN du cockpit vendeur (défaut démo `super1234`, **changez-le**).
@@ -202,7 +203,7 @@ Palette sur-mesure, aucune couleur « IA » : vert wagon `#16301F`, crème `#F6F
 ## Organisation du dépôt
 
 ```
-barber-loyalty/
+barber_shop/
 ├─ server.js                 # Plateforme : API tenant + super-admin + static + pages injectées
 ├─ vercel.json               # Tout → /api/index (Vercel), Postgres via POSTGRES_URL
 ├─ api/index.js              # Entry serverless : recharge la plateforme depuis Postgres par requête

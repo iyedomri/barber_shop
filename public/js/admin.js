@@ -207,7 +207,7 @@ async function handleScannedCode(code) {
 function showScanResult(data, isError, message) {
   const card = data.card;
   $('#scanResultName').textContent = card ? card.name : 'Carte introuvable';
-  $('#scanResultStamps').textContent = card ? `${card.stamps}/${data.reward ? data.reward.stampGoal : 10}` : '—/—';
+  $('#scanResultStamps').textContent = card ? `${card.stamps}/${data.reward ? data.reward.stampGoal : (window.STAMP_GOAL || 10)}` : '—/—';
   $('#scanResultMsg').textContent = message || data.message || (isError ? 'Un problème est survenu.' : '');
   const redeem = $('#scanRedeemBtn');
   const full = data.reward && data.reward.rewardReady;
@@ -233,7 +233,7 @@ $('#scanRedeemBtn').addEventListener('click', async () => {
   try {
     const data = await api(API_BASE + '/api/admin/redeem-by-code', { method: 'POST', body: JSON.stringify({ code: currentScanCode }) });
     $('#scanRedeemBtn').classList.add('hidden');
-    $('#scanResultStamps').textContent = '0/10';
+    $('#scanResultStamps').textContent = '0/' + (window.STAMP_GOAL || 10);
     $('#scanResultMsg').textContent = data.message;
     scanStatus.textContent = 'Coupe offerte validée.';
     toast(data.message);
@@ -539,7 +539,9 @@ $('#printReport').addEventListener('click', () => window.print());
 
 /* ================= chargement global ================= */
 async function refreshAll() {
-  await Promise.allSettled([loadOverview(), loadClients(), loadServices(), loadOffers(), loadSettings(), loadReservations()]);
+  // settings d’abord : window.STAMP_GOAL doit être connu avant d’afficher les cartes clients
+  await loadSettings().catch(() => {});
+  await Promise.allSettled([loadOverview(), loadClients(), loadServices(), loadOffers(), loadReservations()]);
 }
 $('#resForm input[name=date]').value = new Date().toISOString().slice(0, 10);
 if (session()) { showApp(); refreshAll(); } else { showLogin(); }
