@@ -72,9 +72,13 @@ essai 14 jours  ──(paie)──▶  actif 30 j  ──(+30 j)──▶  actif
 2. **Vercel → Storage → Postgres** (ou Neon) → *Connect* : la variable **`POSTGRES_URL`** est injectée automatiquement.
 3. Variables d’environnement :
    - `SUPER_ADMIN_PIN` — le PIN du cockpit vendeur (défaut démo `super1234`, **changez-le**).
-   - `SEED_DEMO=false` — optionnel : démarre sans les 2 salons de démo (production vierge).
+   - `SEED_DEMO=false` — optionnel : démarre sans les 2 salons de démo (production vierge — la landing masque aussi son bloc démo).
    - `D17_NUMBER` — **votre numéro D17** (mobile money), affiché sur la page de pause avec la consigne de paiement. Sans lui, la pause n’affiche que l’email de contact.
    - `PAYMENT_LINK` — optionnel : lien Stripe Payment Link affiché en bouton « Régler par carte » sur la page de pause (défaut global ; chaque salon peut avoir le sien dans `/super`).
+   - `SESSION_SECRET` — recommandé (`openssl rand -hex 32`) : clé de signature des sessions admin/super. Sans lui, la clé VAPID persistée en base sert de secret.
+   - `TZ=Africa/Tunis` — fuseau des dates et créneaux (le code s’y ancre par défaut si `TZ` est absent).
+
+   Le guide complet pas-à-pas : **[`deploy/VERCEL.md`](deploy/VERCEL.md)**.
 4. **Deploy**. C’est tout : `vercel.json` redirige tout vers la fonction `api/index.js` ; les pages, assets et API tournent sous `/s/<slug>/…`. `POSTGRES_URL` absent → 500 explicite sur les routes dynamiques (le statique, dont la landing, reste servi).
 
 Une **ligne Postgres** (`barbier_kv.platform`, jsonb) tient toute la plateforme (≈ quelques centaines de Ko pour des dizaines de salons). Chaque requête dynamique recharge la ligne, chaque écriture la sauve (read-modify-write ; parfait à l’échelle d’un réseau de salons — pas de verrous distribués, dernier écrivain gagne).
@@ -87,7 +91,7 @@ Une **ligne Postgres** (`barbier_kv.platform`, jsonb) tient toute la plateforme 
 - ✅ **Isolation stricte** : chaque requête salon transporte son `AsyncLocalStorage` ; le store (clients/services/…) est résolu par `slug` → **un PIN du salon A ne vaut rien au salon B**, les tokens de carte aussi (vérifié par tests curl).
 - ✅ **PIN admin hashés** (scrypt + sel) depuis la v5 — `db.json` ne contient plus aucun PIN.
 - ✅ Tampon **exclusivement barber-side** ; QR client = identité, jamais un droit de se tamponner.
-- ✅ Rate-limit mémoire (`/api/join` 20/min, `/api/admin/login` 10/min) · sessions admin 12 h **liées au salon** · token carte 192 bits · `noindex` admin · `/super` cachée des moteurs.
+- ✅ Rate-limit (`/api/join` 20/min, `/api/admin/login` et `/super/api/login` 10/min — IP réelle via `X-Forwarded-For`) · sessions admin 12 h **signées HMAC, liées au salon, sans état en mémoire** (validables par toutes les instances — compatible Vercel) · token carte 192 bits · `noindex` admin · `/super` cachée des moteurs.
 - ✅ Page de pause : tout le salon (clients **et** barbier) est verrouillé quand l’abonnement n’est pas à jour — c’est ce qui fait tourner le modèle.
 - ❌ Pas de chiffrement au repos, pas d’OTP SMS, pas de D17/Stripe automatisé (voir *Roadmap P1*) — gardez `POSTGRES_URL` secret, tournez le `SUPER_ADMIN_PIN`, sauvegardez la base.
 
@@ -210,12 +214,12 @@ barber_shop/
 ├─ package.json              # pg inclus (optionnel en local, requis sur Vercel)
 ├─ data/db.json              # v5 : la plateforme entière (créé au 1er lancement — git-ignoré)
 ├─ views/                    # Templates ({{SHOP_NAME}}…) — rendus SEULEMENT par le serveur
+│  ├─ landing.html           # Page vendeur (pitch, prix) — bloc démo visible seulement si SEED_DEMO
 │  ├─ paywall.html           # Page « abonnement en pause » ({{D17_BLOCK}} · {{STRIPE_BUTTON}})
 │  ├─ index.html             # La carte (liens `{{API_BASE}}`, marque `{{SHOP_NAME}}…`)
 │  ├─ admin.html             # Espace barbier (réglages identité : accent, monogramme, devise…)
 │  └─ display.html · poster.html
 ├─ public/                   # Statique SANS placeholder (sûr à servir directement, ex. CDN Vercel)
-│  ├─ landing.html           # Page vendeur CarteBarber (pitch, prix, salons équipés)
 │  ├─ super.html             # Cockpit vendeur : salons, MRR, essai/pause/+30 j
 │  ├─ css/style.css          # Design system « green/cream/brass » + accents par salon
 │  └─ js/card.js · js/admin.js   # fetch préfixé par window.__API_BASE__

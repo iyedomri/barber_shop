@@ -5,6 +5,10 @@
  */
 'use strict';
 
+// Fuseau horaire du salon pilote : sur Vercel (UTC par défaut), les dates « aujourd’hui »
+// et les créneaux basculeraient d’une heure — on s’ancre sur Tunis si TZ n’est pas défini.
+if (!process.env.TZ) process.env.TZ = 'Africa/Tunis';
+
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -322,14 +326,32 @@ function persistFile() {
   fs.writeFileSync(tmp, JSON.stringify(platform, null, 2));
   fs.renameSync(tmp, DB_FILE);
 }
-async function persistPostgres() {
-  const { Client } = require('pg'); // dépendance optionnelle — uniquement si POSTGRES_URL est défini
-  const client = new Client({ connectionString: process.env.POSTGRES_URL, ssl: process.env.POSTGRES_SSL === 'false' ? false : { rejectUnauthorized: false } });
-  await client.connect();
+/* Pool pg partagé par instance lambda : évite une connexion TLS par requête. */
+let pgPool = null;
+let pgTableEnsured = false;
+function getPgPool() {
+  if (!pgPool) {
+    const { Pool } = require('pg'); // dépendance optionnelle — uniquement si POSTGRES_URL est défini
+    pgPool = new Pool({ connectionString: process.env.POSTGRES_URL, max: 1, ssl: process.env.POSTGRES_SSL === 'false' ? false : { rejectUnauthorized: false } });
+  }
+  return pgPool;
+}
+async function pgQuery(sql, params) {
   try {
-    await client.query('CREATE TABLE IF NOT EXISTS barbier_kv (key text PRIMARY KEY, value jsonb NOT NULL)');
-    await client.query('INSERT INTO barbier_kv (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value', ['platform', JSON.stringify(platform)]);
-  } finally { await client.end(); }
+    return await getPgPool().query(sql, params);
+  } catch (e) {
+    pgPool = null; pgTableEnsured = false; // connexion morte → on recrée au prochain appel
+    throw e;
+  }
+}
+async function ensurePgTable() {
+  if (pgTableEnsured) return;
+  await pgQuery('CREATE TABLE IF NOT EXISTS barbier_kv (key text PRIMARY KEY, value jsonb NOT NULL)');
+  pgTableEnsured = true;
+}
+async function persistPostgres() {
+  await ensurePgTable();
+  await pgQuery('INSERT INTO barbier_kv (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value', ['platform', JSON.stringify(platform)]);
 }
 function saveDb() {
   if (IS_PG) { platformDirty = true; return; } // persisté en fin de requête (Vercel)
@@ -351,17 +373,12 @@ async function flushPersist() {
 }
 async function loadPlatform() {
   if (IS_PG) {
-    const { Client } = require('pg');
-    const client = new Client({ connectionString: process.env.POSTGRES_URL, ssl: process.env.POSTGRES_SSL === 'false' ? false : { rejectUnauthorized: false } });
-    await client.connect();
-    try {
-      await client.query('CREATE TABLE IF NOT EXISTS barbier_kv (key text PRIMARY KEY, value jsonb NOT NULL)');
-      const r = await client.query("SELECT value FROM barbier_kv WHERE key='platform'");
-      platform = r.rows.length ? r.rows[0].value : (SEED_DEMO ? seedPlatform() : { version: PLATFORM_VERSION, tenants: [], stores: {}, vapid: null });
-      if (!r.rows.length) await persistPostgres();
-      relinkStores();
-      console.log(`[db] plateforme chargée depuis Postgres — ${platform.tenants.length} salon(s)`);
-    } finally { await client.end(); }
+    await ensurePgTable();
+    const r = await pgQuery("SELECT value FROM barbier_kv WHERE key='platform'");
+    platform = r.rows.length ? r.rows[0].value : (SEED_DEMO ? seedPlatform() : { version: PLATFORM_VERSION, tenants: [], stores: {}, vapid: null });
+    if (!r.rows.length) await persistPostgres();
+    relinkStores();
+    console.log(`[db] plateforme chargée depuis Postgres — ${platform.tenants.length} salon(s)`);
     return;
   }
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -379,20 +396,42 @@ async function loadPlatform() {
   }
 }
 
-/* ---------------------------------------------------- admin sessions (par tenant) */
-const sessions = new Map(); // token -> { expiry, tenantId }
-const newSession = (tenantId) => {
-  const s = crypto.randomBytes(24).toString('hex');
-  sessions.set(s, { expiry: now() + 12 * 3600e3, tenantId });
-  return s;
+/* ---------------------------------------------------- sessions (par tenant)
+   Tokens signés HMAC — AUCUN état en mémoire : chaque instance lambda Vercel peut
+   valider une session créée par une autre. Durée 12 h. La déconnexion = oubli du
+   token côté client (pas de révocation serveur, la fenêtre est bornée par l’expiry). */
+const sessionSecret = () => String(process.env.SESSION_SECRET
+  || (platform && platform.vapid && platform.vapid.privateKey)
+  || SUPER_ADMIN_PIN);
+const signSession = (payload, ttlMs) => {
+  const body = Buffer.from(JSON.stringify({ ...payload, exp: now() + ttlMs })).toString('base64url');
+  const sig = crypto.createHmac('sha256', sessionSecret()).update(body).digest('base64url');
+  return body + '.' + sig;
 };
+const verifySession = (token) => {
+  const s = String(token || '');
+  const dot = s.lastIndexOf('.');
+  if (dot <= 0) return null;
+  const body = s.slice(0, dot), sig = s.slice(dot + 1);
+  const expect = crypto.createHmac('sha256', sessionSecret()).update(body).digest('base64url');
+  const a = Buffer.from(sig), b = Buffer.from(expect);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  try {
+    const p = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+    return p && p.exp > now() ? p : null;
+  } catch { return null; }
+};
+const newSession = (tenantId) => signSession({ typ: 'admin', tid: tenantId }, 12 * 3600e3);
 const validSession = (s, tenantId) => {
-  const e = s && sessions.get(s);
-  return !!(e && e.expiry > now() && e.tenantId === tenantId);
+  const p = verifySession(s);
+  return !!(p && p.typ === 'admin' && p.tid === tenantId);
 };
 
 /* --------------------------------------------------- rate limiting */
 const buckets = new Map(); // key -> {count, reset}
+// Derrière un proxy (Vercel/Caddy), socket.remoteAddress est l’IP du proxy — tout le
+// monde partagerait le même seau. On prend la vraie IP client (X-Forwarded-For).
+const clientIp = (req) => String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'ip';
 function rateLimit(key, max, windowMs) {
   const b = buckets.get(key);
   const t = now();
@@ -554,8 +593,8 @@ function tenantBrandVars(t) {
     '{{PAYMENT_LINK}}': link ? escHtml(link) : 'mailto:iyedomri922@gmail.com',
     '{{CONTACT_EMAIL}}': 'iyedomri922@gmail.com',
     '{{D17_NUMBER}}': escHtml(process.env.D17_NUMBER || ''),
-    '{{D17_BLOCK}}': (() => { const n = String(process.env.D17_NUMBER || '').trim(); return n ? '<div style="margin:0 0 14px;padding:14px 12px;border:1px dashed var(--brass,#C2A04E);border-radius:14px;background:rgba(194,160,78,.08)"><div style="font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--brass-dark,#A8843A);margin-bottom:6px">Paiement D17 — mobile money</div><div style="font-family:var(--font-display);font-size:22px;font-weight:600;color:#16301F;letter-spacing:.04em">' + escHtml(n) + '</div><div style="font-size:11px;color:#5B5343;margin-top:4px">Envoyez <b>{{MONTHLY_PRICE}} DT</b> (un mois d’abonnement) avec votre nom de salon en référence. Le barbier rallume le salon dès réception.</div></div>' : ''; })(),
-    '{{STRIPE_BUTTON}}': (() => { const l = link; return l ? '<a href="' + escHtml(l) + '" class="btn btn-brass btn-full" style="text-decoration:none;display:block">Régler par carte — {{MONTHLY_PRICE}} DT / mois</a>' : ''; })(),
+    '{{D17_BLOCK}}': (() => { const price = String(t.monthlyPrice ?? 40); const n = String(process.env.D17_NUMBER || '').trim(); return n ? '<div style="margin:0 0 14px;padding:14px 12px;border:1px dashed var(--brass,#C2A04E);border-radius:14px;background:rgba(194,160,78,.08)"><div style="font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--brass-dark,#A8843A);margin-bottom:6px">Paiement D17 — mobile money</div><div style="font-family:var(--font-display);font-size:22px;font-weight:600;color:#16301F;letter-spacing:.04em">' + escHtml(n) + '</div><div style="font-size:11px;color:#5B5343;margin-top:4px">Envoyez <b>' + price + ' DT</b> (un mois d’abonnement) avec votre nom de salon en référence. Le barbier rallume le salon dès réception.</div></div>' : ''; })(),
+    '{{STRIPE_BUTTON}}': (() => { const l = link; const price = String(t.monthlyPrice ?? 40); return l ? '<a href="' + escHtml(l) + '" class="btn btn-brass btn-full" style="text-decoration:none;display:block">Régler par carte — ' + price + ' DT / mois</a>' : ''; })(),
     '{{MONTHLY_PRICE}}': String(t.monthlyPrice ?? 40),
   };
 }
@@ -568,6 +607,14 @@ function renderPublicFile(file, tenant) {
     html = html.split('{{TENANT_CSS}}').join('');
   }
   return html;
+}
+/* Landing vendeur : rendue par le serveur SANS base de données — le bloc démo
+   (liens + PINs des salons de démonstration) n’apparaît QUE si SEED_DEMO est actif.
+   En production (SEED_DEMO=false) : aucun lien mort, aucun PIN public. */
+function renderLanding() {
+  const html = fs.readFileSync(path.join(VIEWS_DIR, 'landing.html'), 'utf8');
+  return html.replace(/<!-- DEMO_(ON|OFF)_START -->[\s\S]*?<!-- DEMO_\1_END -->/g,
+    (m, tag) => ((tag === 'ON') === SEED_DEMO ? m.replace(/<!--[\s\S]*?-->/g, '') : ''));
 }
 const TENANT_PAGES = { '/': 'index.html', '/admin': 'admin.html', '/poster': 'poster.html', '/display': 'display.html' };
 function tenantIsActive(t) {
@@ -657,7 +704,7 @@ route('GET', '/api/shop', (req, res) => sendJson(res, 200, shopPublic()));
 
 /* ---- public: join / card / stamp / redeem ----------------------------- */
 route('POST', '/api/join', async (req, res) => {
-  const ip = req.socket.remoteAddress || 'ip';
+  const ip = clientIp(req);
   if (!rateLimit('join:' + ip, 20, 60e3)) return sendJson(res, 429, { error: 'Trop de tentatives, réessayez dans une minute.' });
   const body = await readBody(req);
   const name = esc(body.name).trim().slice(0, 80);
@@ -758,7 +805,7 @@ route('GET', '/api/slots', (req, res, query) => {
   sendJson(res, 200, { date, duration, slots: slotList(date, duration) });
 });
 route('POST', '/api/reserve', async (req, res) => {
-  const ip = req.socket.remoteAddress || 'ip';
+  const ip = clientIp(req);
   if (!rateLimit('reserve:' + ip, 10, 3600e3)) return sendJson(res, 429, { error: 'Trop de réservations d’affilée — réessayez plus tard.' });
   const body = await readBody(req);
   if (db.shop.acceptReservations === false) return sendJson(res, 409, { error: 'Les réservations sont momentanément suspendues — passez en direct.' });
@@ -868,7 +915,7 @@ route('POST', '/api/push/subscribe', async (req, res) => {
 
 /* ---- admin: auth -------------------------------------------------------- */
 route('POST', '/api/admin/login', async (req, res) => {
-  const ip = req.socket.remoteAddress || 'ip';
+  const ip = clientIp(req);
   if (!rateLimit('login:' + ip, 10, 60e3)) return sendJson(res, 429, { error: 'Trop de tentatives. Réessayez dans une minute.' });
   const body = await readBody(req);
   if (!scryptCheck(body.pin, db.shop.adminPinHash)) return sendJson(res, 403, { error: 'Code PIN incorrect.' });
@@ -1243,11 +1290,9 @@ route('GET', '/api/client-qr', async (req, res, query) => {
 });
 
 /* ============================================================== super-admin (le vendeur) */
-const superSessions = new Map(); // token -> expiry
 const superSessionOk = (req) => {
-  const s = req.headers['x-super-session'];
-  const e = s && superSessions.get(s);
-  return !!(e && e > now());
+  const p = verifySession(req.headers['x-super-session']);
+  return !!(p && p.typ === 'super');
 };
 function findTenantById(id) { return platform.tenants.find(t => t.id === id) || null; }
 function tenantStats(t) {
@@ -1278,13 +1323,11 @@ async function handleSuperApi(req, res, rest) {
       // fallthrough below
     }
     if (rest === '/api/login' && req.method === 'POST') {
-      const ip = req.socket.remoteAddress || 'ip';
+      const ip = clientIp(req);
       if (!rateLimit('superlogin:' + ip, 10, 60e3)) return sendJson(res, 429, { error: 'Trop de tentatives. Réessayez dans une minute.' });
       const body = await readBodyMaybe(req);
       if (String(body.pin) !== String(SUPER_ADMIN_PIN)) return sendJson(res, 403, { error: 'Code super-admin incorrect.' });
-      const s = crypto.randomBytes(24).toString('hex');
-      superSessions.set(s, now() + 12 * 3600e3);
-      return sendJson(res, 200, { session: s });
+      return sendJson(res, 200, { session: signSession({ typ: 'super' }, 12 * 3600e3) });
     }
     if (!superSessionOk(req)) return sendJson(res, 401, { error: 'Session super-admin requise.' });
 
@@ -1413,7 +1456,7 @@ const server = http.createServer(async (req, res) => {
     if (pathname.startsWith('/super/api/')) return handleSuperApi(req, res, pathname.slice('/super'.length));
 
     /* ---------- plateforme : landing + assets globaux ---------- */
-    if (pathname === '/') return serveStaticFile(res, '/landing.html');
+    if (pathname === '/' || pathname === '/landing.html') return sendHtml(res, renderLanding());
     if (req.method === 'GET') return serveStaticFile(res, pathname);
     notFound(res, pathname);
   } catch (err) {
@@ -1426,6 +1469,8 @@ async function boot() {
   await loadPlatform();
   ensureVapid();
   if (IS_PG) await flushPersist();
+  if (SUPER_ADMIN_PIN === 'super1234') console.warn('[prod] ⚠️  SUPER_ADMIN_PIN est la valeur de démonstration — changez-le (variable d’environnement SUPER_ADMIN_PIN).');
+  if (IS_PG && SEED_DEMO) console.warn('[prod] ⚠️  SEED_DEMO est actif : les salons de démonstration seront créés — mettez SEED_DEMO=false en production.');
 }
 
 if (require.main === module) {
