@@ -76,6 +76,7 @@ essai 14 jours  ──(paie)──▶  actif 30 j  ──(+30 j)──▶  actif
    - `D17_NUMBER` — **votre numéro D17** (mobile money), affiché sur la page de pause avec la consigne de paiement. Sans lui, la pause n’affiche que l’email de contact.
    - `PAYMENT_LINK` — optionnel : lien Stripe Payment Link affiché en bouton « Régler par carte » sur la page de pause (défaut global ; chaque salon peut avoir le sien dans `/super`).
    - `SESSION_SECRET` — recommandé (`openssl rand -hex 32`) : clé de signature des sessions admin/super. Sans lui, la clé VAPID persistée en base sert de secret.
+   - `GOOGLE_CLIENT_ID` — optionnel : active la **connexion client par compte Google** (bouton sur la carte). À créer dans Google Cloud Console → *Identifiants → ID client OAuth (application Web)*, origine JavaScript autorisée = votre domaine. Sans lui, la connexion par numéro de téléphone reste seule.
    - `TZ=Africa/Tunis` — fuseau des dates et créneaux (le code s’y ancre par défaut si `TZ` est absent).
 
    Le guide complet pas-à-pas : **[`deploy/VERCEL.md`](deploy/VERCEL.md)**.
@@ -158,11 +159,11 @@ Persistance : `data/db.json` (atomique tmp+rename) **ou** Postgres single-row `b
 
 ### 6. API REST (toutes sous `/s/<slug>/`)
 
-**Public** — `POST /api/join` · `GET /api/card?token=` (anniversaire jour J inclus) · `POST /api/onmyway` · `GET /api/notifications?token=` · `POST /api/notifications/read` · `GET /api/shop` (marque incluse) · `GET /api/client-qr?token=` · `GET /api/push/key` · `POST /api/push/subscribe` · `GET /api/availability?date=` · `GET /api/slots?date=&duration=` · `POST /api/reserve` · `GET /api/my-reservations?token=` · `POST /api/reservations/cancel` · `GET /api/counter-qr` (SVG QR d’adhésion)
+**Public** — `POST /api/join` · `POST /api/login/phone` (connexion par numéro — le token est renouvelé) · `POST /api/login/google` (ID token Google vérifié côté serveur — JWKS, émetteur, audience, signature) · `GET /api/card?token=` (anniversaire jour J inclus) · `POST /api/onmyway` · `GET /api/notifications?token=` · `POST /api/notifications/read` · `GET /api/shop` (marque incluse) · `GET /api/client-qr?token=` · `GET /api/push/key` · `POST /api/push/subscribe` · `GET /api/availability?date=` · `GET /api/slots?date=&duration=` · `POST /api/reserve` · `GET /api/my-reservations?token=` · `POST /api/reservations/cancel` · `GET /api/counter-qr` (SVG QR d’adhésion)
 
 **Admin** (header `x-admin-session`, session liée au salon) — `POST /api/admin/login` · `GET /api/admin/overview` · `GET /api/admin/report` · `GET /api/admin/clients?q=` · `POST /api/admin/stamp|redeem|stamp-by-code|redeem-by-code` · `DELETE /api/admin/clients/:id` · CRUD `/api/admin/services[/:id]` · CRUD `/api/admin/offers[/:id]` · CRUD `/api/admin/reservations[/:id]` · `POST /api/admin/remind-lapsed` · `GET|PUT /api/admin/settings` (identité, accent, monogramme, devise, PIN) · `GET /api/admin/settings` renvoie aussi `accents` disponibles
 
-**Super-admin** (header `x-super-session`, `/super` uniquement) — `POST /super/api/login` · `GET /super/api/overview` (MRR, compteurs, essais < 7 j) · `POST /super/api/tenants` (créer salon) · `GET|POST /super/api/tenants/:id[/pay|pause|resume|delete]`
+**Super-admin** (header `x-super-session`, `/super` uniquement) — `POST /super/api/login` (PIN env OU PIN changé dans l’app, hashé scrypt) · `GET /super/api/overview` (MRR, compteurs, échéances < 7 j, journal des encaissements) · `POST /super/api/tenants` (créer salon) · `POST /super/api/tenants/:id/pay` (**encaissement espèces / D17 / carte** → +30 j, journalisé) · `POST /super/api/tenants/:id/trial` (prolonger l’essai de N j) · `POST /super/api/tenants/:id/reset-pin` (nouveau PIN barbier) · `POST /super/api/tenants/:id[/pause|resume|delete]` · `POST /super/api/settings/pin` (changer le PIN super-admin)
 
 ### 7. Choix techniques — et pourquoi
 - **Node quasi zéro dépendance** (`qrcode`, `web-push`, `pg` optionnel) : démarre partout, rien à compiler.

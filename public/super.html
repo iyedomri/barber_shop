@@ -103,10 +103,46 @@
     </form>
   </div>
 
-  <div class="panel" style="margin-top:14px;font-size:10px;color:#A79C88;line-height:1.8">
-    <b style="color:var(--cream)">Cycle d’abonnement</b> — Essai 14 jours ou Actif (30 jours, « +30 j » à chaque paiement). « En pause » bloque le salon (page de paiement D17 + email affichée). « Suppr. » efface définitivement le salon et ses données.<br>
-    <b style="color:var(--cream)">Encaissement</b> — D17 (mobile money) sur votre numéro, virement avec nom du salon en référence → vous cliquez « +30 j payé ». Contact commercial/support : <b style="color:var(--brass-light)">iyedomri922@gmail.com</b>. Le lien de paiement d’un salon, s’il est renseigné, s’affiche en bouton « Régler par carte » sur sa page de pause.
+  <div class="panel" style="margin-top:14px">
+    <h2>Paiements reçus</h2>
+    <div id="payList"><div style="color:#A79C88;font-size:12px">Aucun encaissement pour l’instant.</div></div>
   </div>
+
+  <div class="panel" style="margin-top:14px">
+    <h2>PIN super-admin</h2>
+    <form id="superPinForm" class="form-grid">
+      <div class="field"><label for="spCurrent">PIN actuel</label><input id="spCurrent" type="password" autocomplete="off" required maxlength="24" placeholder="••••"></div>
+      <div class="field"><label for="spNew">Nouveau PIN</label><input id="spNew" type="password" autocomplete="off" required minlength="4" maxlength="24" placeholder="min. 4 caractères"></div>
+      <button class="t-btn gold full" type="submit" style="grid-column:1/-1;padding:11px">Changer le PIN</button>
+    </form>
+    <p style="font-size:10px;color:#A79C88;margin:8px 0 0;line-height:1.6">Le PIN d’origine (variable d’environnement) reste valable en secours. Les PIN des salons se gèrent via le bouton « PIN » de chaque ligne.</p>
+  </div>
+
+  <div class="panel" style="margin-top:14px;font-size:10px;color:#A79C88;line-height:1.8">
+    <b style="color:var(--cream)">Cycle d’abonnement</b> — Essai 14 jours ou Actif (30 jours, « +30 j payé » à chaque paiement : espèces, D17 ou carte). « En pause » bloque le salon (page de paiement D17 + email affichée). « Suppr. » efface définitivement le salon et ses données.<br>
+    <b style="color:var(--cream)">Encaissement</b> — D17 (mobile money) sur votre numéro, ou espèces au salon → cliquez « +30 j payé » et choisissez la méthode : chaque encaissement est journalisé plus bas. Contact commercial/support : <b style="color:var(--brass-light)">iyedomri922@gmail.com</b>.
+  </div>
+</div>
+
+<!-- ═══ modal encaissement ═══ -->
+<div class="super-login hidden" id="payModal" style="position:fixed;inset:0;background:rgba(10,20,14,.6);z-index:40">
+  <form class="panel" id="payForm" style="width:min(430px,92vw);background:#1E3A29">
+    <h2>Encaissement — +30 jours</h2>
+    <p id="payTenantName" style="color:#A79C88;font-size:12px;margin:0 0 12px"></p>
+    <div class="field" style="margin-bottom:10px"><label for="payAmount">Montant reçu (DT)</label><input id="payAmount" type="number" min="0" step="1" value="40"></div>
+    <div class="field" style="margin-bottom:10px">
+      <label>Méthode de paiement</label>
+      <div id="payMethods" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
+        <button type="button" class="t-btn gold" data-method="cash">💵 Espèces</button>
+        <button type="button" class="t-btn" data-method="d17">📱 D17</button>
+        <button type="button" class="t-btn" data-method="card">💳 Carte</button>
+        <button type="button" class="t-btn" data-method="other">Autre</button>
+      </div>
+    </div>
+    <div class="field" style="margin-bottom:14px"><label for="payNote">Note (optionnel)</label><input id="payNote" maxlength="140" placeholder="ex : reçu au salon le 21/11"></div>
+    <button class="btn btn-brass btn-full" type="submit" style="padding:13px;font-size:14px">Valider — le salon passe en actif</button>
+    <button class="t-btn" type="button" id="payCancel" style="width:100%;margin-top:8px">Annuler</button>
+  </form>
 </div>
 
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
@@ -114,6 +150,7 @@
 <script>
 'use strict';
 const $ = (s, p) => (p || document).querySelector(s);
+const $$ = (s) => [...document.querySelectorAll(s)];
 const SS = 'cartebarber_super';
 const toast = (msg, isErr) => { const t = $('#toast'); t.textContent = msg; t.style.borderColor = isErr ? '#8A3A3A' : 'var(--brass)'; t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 4200); };
 const api = async (path, opts = {}) => {
@@ -124,28 +161,56 @@ const api = async (path, opts = {}) => {
 };
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 
+let lastTenants = [];
+const METHOD_LABELS = { cash: '💵 Espèces', d17: '📱 D17', card: '💳 Carte', other: 'Autre' };
 function render(data) {
+  lastTenants = data.tenants || [];
   $('#kMrr').textContent = data.mrr;
   $('#kActive').textContent = data.counts.active;
   $('#kTrial').textContent = data.counts.trial;
   $('#kPaused').textContent = data.counts.paused;
   $('#kClients').textContent = data.tenants.reduce((s, t) => s + (t.stats?.clients || 0), 0);
+  // Alertes : échéances sous 7 j (essais + périodes) et salons bloqués — avec actions directes
+  const fmt = (d) => new Date(d).toLocaleDateString('fr-FR');
+  const daysLeft = (d) => Math.ceil((new Date(d) - Date.now()) / 864e5);
+  const alerts = [];
+  for (const t of data.tenants) {
+    if (t.status === 'trial' && t.trialEndsAt && daysLeft(t.trialEndsAt) <= 7) {
+      const n = daysLeft(t.trialEndsAt);
+      alerts.push(`<div style="margin:4px 0">🟡 <b>${esc(t.name)}</b> — essai ${n > 0 ? 'finit dans ' + n + ' j' : 'expiré'} (${fmt(t.trialEndsAt)}) · <button class="t-btn gold" data-id="${esc(t.id)}" data-act="pay">+30 j payé</button> <button class="t-btn" data-id="${esc(t.id)}" data-act="trial">+7 j essai</button></div>`);
+    }
+    if (t.status === 'active' && t.currentPeriodEnd && daysLeft(t.currentPeriodEnd) <= 7) {
+      const n = daysLeft(t.currentPeriodEnd);
+      alerts.push(`<div style="margin:4px 0">🟠 <b>${esc(t.name)}</b> — période ${n > 0 ? 'finit dans ' + n + ' j' : 'expirée'} (${fmt(t.currentPeriodEnd)}) · <button class="t-btn gold" data-id="${esc(t.id)}" data-act="pay">+30 j payé</button></div>`);
+    }
+    if (!t.active && t.status !== 'trial') {
+      alerts.push(`<div style="margin:4px 0">🔴 <b>${esc(t.name)}</b> — salon bloqué (${t.status === 'paused' ? 'en pause' : 'non à jour'}) · <button class="t-btn gold" data-id="${esc(t.id)}" data-act="pay">Encaisser</button> <button class="t-btn" data-id="${esc(t.id)}" data-act="resume">Rouvrir</button></div>`);
+    }
+  }
   const warn = $('#trialWarn');
-  if (data.trialSoon && data.trialSoon.length) {
-    warn.classList.remove('hidden');
-    warn.innerHTML = '<b>Échéances sous 7 jours :</b><br>' + data.trialSoon.map(t =>
-      '· ' + esc(t.name) + (t.kind === 'trial' ? ' — fin d’essai le ' : ' — période qui finit le ') + new Date(t.endsAt).toLocaleDateString('fr-FR')
-    ).join('<br>');
-  } else warn.classList.add('hidden');
+  if (alerts.length) { warn.classList.remove('hidden'); warn.innerHTML = '<b>⚠️ Notifications — à traiter :</b><br>' + alerts.join(''); }
+  else warn.classList.add('hidden');
+  // Historique des encaissements
+  const pays = data.payments || [];
+  $('#payList').innerHTML = pays.length ? pays.map(p => `
+    <div class="tenant-row" style="grid-template-columns:1.2fr 1fr .8fr .8fr">
+      <div><b>${esc(p.tenantName)}</b><small>${new Date(p.at).toLocaleDateString('fr-FR', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}${p.note ? ' · ' + esc(p.note) : ''}</small></div>
+      <span style="color:var(--brass-light);font-weight:700">${esc(String(p.amount))} ${esc(p.currency || 'DT')}</span>
+      <span style="font-size:11px">${METHOD_LABELS[p.method] || esc(p.method)}</span>
+      <span style="font-size:10px;color:#A79C88">+30 jours</span>
+    </div>`).join('') : '<div style="color:#A79C88;font-size:12px">Aucun encaissement pour l’instant.</div>';
+  // Salons
   $('#tenantList').innerHTML = data.tenants.map(t => `
     <div class="tenant-row" data-id="${esc(t.id)}" data-slug="${esc(t.slug)}">
-      <div><b>${esc(t.name)}</b><small>/s/${esc(t.slug)}/ · ${esc(t.address || 'sans adresse')} · ${esc(String(t.monthlyPrice))} DT/mois${t.currentPeriodEnd ? ' · renouvellement le ' + new Date(t.currentPeriodEnd).toLocaleDateString('fr-FR') : ''}${t.status === 'trial' && t.trialEndsAt ? ' · essai jusqu’au ' + new Date(t.trialEndsAt).toLocaleDateString('fr-FR') : ''}<br>${t.stats.clients} clients · ${t.stats.stamps} tampons · ${t.stats.reservations} rés.</small></div>
+      <div><b>${esc(t.name)}</b><small>/s/${esc(t.slug)}/ · ${esc(t.address || 'sans adresse')} · ${esc(String(t.monthlyPrice))} DT/mois${t.currentPeriodEnd ? ' · renouvellement le ' + fmt(t.currentPeriodEnd) : ''}${t.status === 'trial' && t.trialEndsAt ? ' · essai jusqu’au ' + fmt(t.trialEndsAt) + ' (' + daysLeft(t.trialEndsAt) + ' j)' : ''}<br>${t.stats.clients} clients · ${t.stats.stamps} tampons · ${t.stats.reservations} rés.</small></div>
       <span class="status-pill ${esc(t.status)}">${t.status === 'active' ? 'actif' : t.status === 'trial' ? 'essai' : 'pause'}</span>
       <span style="font-size:10px;color:#A79C88">${t.active ? 'accessible' : 'bloqué'}</span>
       <div class="t-actions">
         ${t.status === 'paused' ? '<button class="t-btn gold" data-act="resume">Rouvrir</button>' : '<button class="t-btn gold" data-act="pay">+30 j payé</button>'}
+        ${t.status === 'trial' ? '<button class="t-btn" data-act="trial">+7 j essai</button>' : ''}
         ${t.status !== 'paused' ? '<button class="t-btn" data-act="pause">Pause</button>' : ''}
-        <button class="t-btn" data-act="copy">Copier le lien client</button>
+        <button class="t-btn" data-act="resetpin">PIN</button>
+        <button class="t-btn" data-act="copy">Lien client</button>
         <button class="t-btn danger" data-act="delete">Suppr.</button>
       </div>
     </div>`).join('') || '<div style="color:#A79C88;font-size:12px">Aucun salon — créez le premier →</div>';
@@ -164,16 +229,73 @@ $('#loginForm').addEventListener('submit', async (e) => {
 });
 $('#logoutBtn').addEventListener('click', () => { sessionStorage.removeItem(SS); showLogin(); });
 
-$('#tenantList').addEventListener('click', async (e) => {
-  const btn = e.target.closest('button[data-act]'); if (!btn) return;
-  const row = btn.closest('.tenant-row'); const id = row.dataset.id; const act = btn.dataset.act;
-  if (act === 'copy') { const url = location.origin + '/s/' + row.dataset.slug + '/'; if (navigator.clipboard?.writeText) navigator.clipboard.writeText(url).then(() => toast('Lien copié : ' + url)).catch(() => prompt('Copiez le lien :', url)); else prompt('Copiez le lien :', url); return; }
+async function tenantAction(id, act) {
+  if (act === 'pay') { openPayModal(id); return; }
   if (act === 'delete' && !confirm('Supprimer définitivement ce salon et TOUTES ses données ?')) return;
+  if (act === 'resetpin' && !confirm('Générer un nouveau PIN pour ce salon ? L’ancien PIN cessera de fonctionner.')) return;
   try {
-    if (act === 'delete') await api('/api/tenants/' + encodeURIComponent(id) + '/delete', { method: 'POST' });
-    else await api('/api/tenants/' + encodeURIComponent(id) + '/' + act, { method: 'POST' });
-    toast(act === 'delete' ? 'Salon supprimé.' : act === 'pay' ? '+30 jours ajoutés.' : act === 'pause' ? 'Salon en pause.' : 'Salon rouvert.');
+    if (act === 'delete') { await api('/api/tenants/' + encodeURIComponent(id) + '/delete', { method: 'POST' }); toast('Salon supprimé.'); }
+    else if (act === 'resetpin') {
+      const r = await api('/api/tenants/' + encodeURIComponent(id) + '/reset-pin', { method: 'POST' });
+      prompt('Nouveau PIN du salon — notez-le et donnez-le au barbier :', r.adminPin);
+    }
+    else if (act === 'trial') { const r = await api('/api/tenants/' + encodeURIComponent(id) + '/trial', { method: 'POST', body: JSON.stringify({ days: 7 }) }); toast(r.message || 'Essai prolongé.'); }
+    else { await api('/api/tenants/' + encodeURIComponent(id) + '/' + act, { method: 'POST' }); toast(act === 'pause' ? 'Salon en pause.' : 'Salon rouvert — 30 jours.'); }
     refresh();
+  } catch (err) { toast(err.message, true); }
+}
+function onActionClick(e) {
+  const btn = e.target.closest('button[data-act]'); if (!btn) return;
+  const row = btn.closest('.tenant-row');
+  const id = btn.dataset.id || (row && row.dataset.id);
+  const act = btn.dataset.act;
+  if (act === 'copy') {
+    const url = location.origin + '/s/' + (row ? row.dataset.slug : '') + '/';
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(url).then(() => toast('Lien copié : ' + url)).catch(() => prompt('Copiez le lien :', url));
+    else prompt('Copiez le lien :', url);
+    return;
+  }
+  if (!id) return;
+  tenantAction(id, act);
+}
+$('#tenantList').addEventListener('click', onActionClick);
+$('#trialWarn').addEventListener('click', onActionClick);
+
+/* ---- modal encaissement (espèces / D17 / carte) ---- */
+let payState = { id: null, method: 'cash' };
+function openPayModal(id) {
+  const t = lastTenants.find(x => x.id === id);
+  if (!t) return;
+  payState = { id, method: 'cash' };
+  $('#payTenantName').textContent = t.name + ' — ' + t.monthlyPrice + ' DT/mois';
+  $('#payAmount').value = t.monthlyPrice ?? 40;
+  $('#payNote').value = '';
+  $$('#payMethods .t-btn').forEach(b => b.classList.toggle('gold', b.dataset.method === 'cash'));
+  $('#payModal').classList.remove('hidden');
+}
+$('#payMethods').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-method]'); if (!b) return;
+  payState.method = b.dataset.method;
+  $$('#payMethods .t-btn').forEach(x => x.classList.toggle('gold', x === b));
+});
+$('#payCancel').addEventListener('click', () => $('#payModal').classList.add('hidden'));
+$('#payForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  try {
+    await api('/api/tenants/' + encodeURIComponent(payState.id) + '/pay', { method: 'POST', body: JSON.stringify({ method: payState.method, amount: Number($('#payAmount').value) || 0, note: $('#payNote').value.trim() }) });
+    $('#payModal').classList.add('hidden');
+    toast('+30 jours — ' + (METHOD_LABELS[payState.method] || payState.method) + ' enregistré.');
+    refresh();
+  } catch (err) { toast(err.message, true); }
+});
+
+/* ---- changer le PIN super-admin ---- */
+$('#superPinForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  try {
+    await api('/api/settings/pin', { method: 'POST', body: JSON.stringify({ pin: $('#spCurrent').value, newPin: $('#spNew').value }) });
+    $('#superPinForm').reset();
+    toast('PIN super-admin changé.');
   } catch (err) { toast(err.message, true); }
 });
 

@@ -62,6 +62,26 @@
 
   <!-- ══════════ VUE : rejoindre (pas encore de carte) ══════════ -->
   <main class="join-wrap" id="joinView">
+    <div class="join-card" id="loginPromptBox" style="text-align:center;padding:14px 20px">
+      <span style="font-size:13px;color:var(--ink-soft)">Vous avez déjà une carte ?</span>
+      <button type="button" class="mini-btn primary" id="showLoginBtn" style="margin-left:8px">Se connecter</button>
+    </div>
+    <div class="join-card hidden" id="loginPanel">
+      <div class="join-eyebrow">J’ai déjà ma carte</div>
+      <h1>Bon retour.</h1>
+      <p class="sub">Connectez-vous avec votre compte Google ou votre numéro de téléphone — votre carte retrouve ses tampons.</p>
+      <div class="error-msg" id="loginError"></div>
+      <div id="gSignInDiv" style="display:flex;justify-content:center;margin:10px 0"></div>
+      <div style="display:flex;align-items:center;gap:10px;margin:12px 0;color:var(--ink-soft);font-size:11px"><span style="flex:1;height:1px;background:var(--cream-2,#E4DCCC)"></span>OU<span style="flex:1;height:1px;background:var(--cream-2,#E4DCCC)"></span></div>
+      <form id="phoneLoginForm" novalidate>
+        <div class="field">
+          <label for="loginPhone">Numéro de téléphone</label>
+          <input id="loginPhone" type="tel" inputmode="tel" autocomplete="tel" placeholder="+216 98 123 456" required maxlength="20">
+        </div>
+        <button class="btn btn-brass btn-full" type="submit" style="font-size:15px;padding:15px">Récupérer ma carte</button>
+      </form>
+      <button type="button" class="mini-btn" id="showJoinBtn" style="margin-top:14px">← Créer une nouvelle carte</button>
+    </div>
     <form class="join-card" id="joinForm" novalidate>
       <div class="join-eyebrow">Carte de fidélité</div>
       <h1>Votre chaise<br>vous attend.</h1>
@@ -283,6 +303,7 @@
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <script>window.__API_BASE__ = {{API_BASE_JS}};</script>
+<script>window.__GOOGLE_CLIENT_ID__ = {{GOOGLE_CLIENT_ID_JS}};</script>
 <script src="/js/card.js"></script>
 </body>
 </html>

@@ -210,6 +210,66 @@ $('#joinForm').addEventListener('submit', async (e) => {
     errBox.classList.add('show');
   }
 });
+
+/* ---------- connexion : Google ou numéro de téléphone ---------- */
+function showLoginError(msg) {
+  const el = $('#loginError');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.add('show');
+}
+$('#showLoginBtn').addEventListener('click', () => {
+  $('#joinForm').classList.add('hidden');
+  $('#loginPromptBox').classList.add('hidden');
+  $('#loginPanel').classList.remove('hidden');
+  initGoogleAuth();
+});
+$('#showJoinBtn').addEventListener('click', () => {
+  $('#loginPanel').classList.add('hidden');
+  $('#joinForm').classList.remove('hidden');
+  $('#loginPromptBox').classList.remove('hidden');
+});
+$('#phoneLoginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const err = $('#loginError');
+  if (err) err.classList.remove('show');
+  try {
+    const data = await api(API_BASE + '/api/login/phone', { method: 'POST', body: JSON.stringify({ phone: $('#loginPhone').value.trim() }) });
+    localStorage.setItem(TOKEN_KEY, data.token);
+    await loadCard();
+    toast('Content de vous revoir — votre carte est là.');
+  } catch (ex) { showLoginError(ex.message); }
+});
+async function onGoogleCredential(resp) {
+  try {
+    const data = await api(API_BASE + '/api/login/google', { method: 'POST', body: JSON.stringify({ credential: resp.credential }) });
+    localStorage.setItem(TOKEN_KEY, data.token);
+    await loadCard();
+    toast(data.created ? 'Bienvenue — votre carte Google est prête.' : 'Content de vous revoir — votre carte est là.');
+  } catch (ex) { showLoginError(ex.message); }
+}
+function renderGoogleBtn(cid) {
+  try {
+    window.google.accounts.id.initialize({ client_id: cid, callback: onGoogleCredential });
+    window.google.accounts.id.renderButton($('#gSignInDiv'), { theme: 'outline', size: 'large', text: 'signin_with', locale: 'fr', width: 320 });
+  } catch { /* GIS indisponible : le numéro suffit */ }
+}
+function initGoogleAuth() {
+  const cid = window.__GOOGLE_CLIENT_ID__;
+  const holder = $('#gSignInDiv');
+  if (!holder) return;
+  if (!cid) { holder.classList.add('hidden'); return; } // Google non configuré → connexion par numéro uniquement
+  holder.classList.remove('hidden');
+  if (window.google && window.google.accounts && window.google.accounts.id) return renderGoogleBtn(cid);
+  if (document.getElementById('gsi-script')) return;
+  const s = document.createElement('script');
+  s.id = 'gsi-script';
+  s.src = 'https://accounts.google.com/gsi/client';
+  s.async = true; s.defer = true;
+  s.onload = () => renderGoogleBtn(cid);
+  s.onerror = () => holder.classList.add('hidden');
+  document.head.appendChild(s);
+}
 $('#bellBtn').addEventListener('click', async () => {
   $('#notifModal').classList.remove('hidden');
   try {
